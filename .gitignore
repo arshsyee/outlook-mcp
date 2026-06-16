@@ -1,0 +1,5 @@
+.token_cache.bin
+.venv/
+__pycache__/
+*.pyc
+.env
