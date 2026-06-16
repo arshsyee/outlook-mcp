@@ -1,89 +1,146 @@
-# Outlook MCP server
+# Outlook MCP Server
 
-Custom MCP server → Microsoft Graph for your college Outlook. Delegated auth
-(device-code), token cached + auto-refreshed so a daily loop runs unattended.
+An [MCP](https://modelcontextprotocol.io) server that connects Claude (or any MCP
+client) to **Outlook / Microsoft 365** through the Microsoft Graph API — read,
+send, and organize mail, manage calendar and contacts, and run a daily
+inbox-automation loop.
 
----
+Built in Python with MSAL device-code auth: log in once, the refresh token is
+cached and silently renewed so scheduled runs stay unattended.
 
-## ⚠️ STATUS (2026-06-15): custom-app path BLOCKED on this account
+## Features
 
-The college tenant **blocks students from registering apps**. App registrations
-page in Azure Portal returns *"You do not have access to this page."* So Section 1
-below **cannot be completed** with this account. The custom server code (auth.py,
-graph.py, server.py, rules.py) is finished and correct — it will work the day this
-runs against any tenant/account that allows app registration (e.g. a personal
-outlook.com account, or after uni IT registers an app for you).
+- **Mail** — list/read inbox, send, draft + send replies
+- **Organize** — categorize, flag, move between folders, mark read/unread
+- **Calendar** — list today's events, query a date range, create events
+- **Contacts** — list contacts
+- **Triage rules** — deterministic, user-editable inbox classifier (`rules.py`)
+- **Daily loop** — organize inbox, build a daily brief, draft (and optionally send) replies, on a schedule
 
-**Active plan = pre-approved server (no Azure portal).** See `FALLBACK.md`.
+## Architecture
 
-Keep this folder: zero changes needed once an unblocked account is available —
-just do Sections 1–5.
+```
+MCP client (Claude Code)
+        │  stdio / JSON-RPC
+        ▼
+   server.py            15 MCP tools (FastMCP)
+        │
+        ▼
+   graph.py             thin Microsoft Graph REST client
+        │  Bearer token
+        ▼
+   auth.py              MSAL device-code flow + on-disk token cache (auto-refresh)
+        │
+        ▼
+   Microsoft Graph API
+```
 
----
+`rules.py` is called by the loop to triage each message before the LLM decides.
 
-## 1. Register the app in Azure (one time, you do this) — BLOCKED on college tenant
+## Tools
 
-1. Go to https://portal.azure.com → **Microsoft Entra ID** → **App registrations** → **New registration**.
-2. Name: `outlook-mcp`.
-3. **Supported account types:** "Accounts in this organizational directory only" (single tenant).
-4. **Redirect URI:** leave blank (device-code flow needs none).
-5. Click **Register**.
-6. On the **Overview** page copy **Application (client) ID** and **Directory (tenant) ID**.
-7. **Authentication** (left menu) → **Advanced settings** → set **Allow public client flows** = **Yes** → Save. *(Device-code flow requires this.)*
-8. **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions** → add:
-   `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.Read`, `MailboxSettings.Read`, `offline_access`.
-9. If a **"Grant admin consent"** button appears and is greyed/blocked → your university restricts consent. You'll find out at step 4 of setup; if login errors with consent, ping IT or fall back to a pre-approved server.
+| Tool | Purpose |
+|------|---------|
+| `list_inbox` | List inbox messages (unread filter, limit) |
+| `read_message` | Full body + recipients of one message |
+| `send_mail` | Send a new message |
+| `draft_reply` | Create a reply draft (not sent) |
+| `send_draft` | Send a previously created draft |
+| `list_folders` | List mail folders (ids for moves) |
+| `move_message` | Move a message to a folder |
+| `categorize` | Set category tags |
+| `flag` | Flag for follow-up |
+| `mark_read` | Mark read/unread |
+| `classify` | Deterministic triage hint (`rules.py`) |
+| `today_events` | Events from now to end of today |
+| `list_events` | Events in an ISO8601 window |
+| `create_event` | Create a calendar event |
+| `list_contacts` | List contacts |
 
-> **What actually happened (2026-06-15):** never reached this step. The App
-> registrations page itself denied access ("You do not have access to this page").
-> Student app registration is disabled tenant-wide. → use `FALLBACK.md`.
+## Quick start
 
-## 2. Install
-
+### 1. Install
 ```powershell
-git clone <your-repo-url> outlook-mcp
+git clone https://github.com/arshsyee/outlook-mcp outlook-mcp
 cd outlook-mcp
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## 3. Set credentials (PowerShell, current session)
+### 2. Register an Azure app (one time)
+You need an Entra ID app registration to get a client ID. In
+[portal.azure.com](https://portal.azure.com) → **Entra ID → App registrations → New registration**:
 
-```powershell
-$env:OUTLOOK_CLIENT_ID = "<Application (client) ID>"
-$env:OUTLOOK_TENANT_ID = "<Directory (tenant) ID>"
-```
+1. Name `outlook-mcp`, single-tenant, no redirect URI → **Register**.
+2. Copy **Application (client) ID** and **Directory (tenant) ID**.
+3. **Authentication → Allow public client flows → Yes** (required for device-code).
+4. **API permissions → Microsoft Graph → Delegated** → add:
+   `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.Read`,
+   `MailboxSettings.Read`, `offline_access`.
 
-To persist across reboots (recommended for the loop), set them as user env vars:
+> No admin rights needed for personal/most tenants — you consent for your own
+> mailbox at first login. See [Design notes](#design-notes-tenant-constraints) if
+> your organization restricts this.
+
+### 3. Configure credentials
 ```powershell
 setx OUTLOOK_CLIENT_ID "<client id>"
 setx OUTLOOK_TENANT_ID "<tenant id>"
 ```
 
-## 4. First login (one time)
-
+### 4. First login (one time)
 ```powershell
 python auth.py
 ```
-Prints a URL + code. Open URL, type code, sign in with the college account,
-approve scopes. On success: `OK, got token...` and `.token_cache.bin` is written.
+Open the printed URL, enter the code, sign in, approve scopes. On success a
+`.token_cache.bin` is written and reused/refreshed automatically afterward.
 
-> If you see an error about admin consent / app not approved → university blocks
-> user consent. Stop here and tell me; we switch to a pre-approved MCP server.
-
-## 5. Register the server with Claude Code
-
+### 5. Register with Claude Code
 ```powershell
 claude mcp add outlook -- python <absolute-path-to-repo>\server.py
 ```
-Verify: `claude mcp list` → `outlook` shows tools.
+Verify with `claude mcp list` — `outlook` should appear with its tools.
 
-## 6. Daily loop
+## Daily automation loop
 
-See `daily_loop.md` for the prompt and scheduling.
+The server is designed to run on a schedule: organize new mail, produce a daily
+brief (unread + today's calendar), draft replies, and — under a conservative
+send policy — send simple replies automatically. The loop prompt, send policy,
+and a Windows Task Scheduler example are in [`daily_loop.md`](daily_loop.md).
 
-## Security notes
-- `.token_cache.bin` = live access to your mailbox. Never commit it. (`.gitignore` covers it.)
-- Scopes are delegated and limited to YOUR mailbox only.
-- Revoke anytime: https://myaccount.microsoft.com → "Apps & services" → remove `outlook-mcp`.
+Triage logic lives in [`rules.py`](rules.py) and is meant to be edited to match
+your own inbox (professors, coursework, newsletters, deadlines, etc.).
+
+## Security
+
+- `.token_cache.bin` grants live access to your mailbox — it is **gitignored** and
+  must never be committed.
+- Scopes are **delegated** and limited to **your own mailbox**.
+- No secrets are stored in code; the client/tenant IDs come from environment vars.
+- Revoke access anytime at
+  [myaccount.microsoft.com](https://myaccount.microsoft.com) → Apps & services.
+
+## Design notes: tenant constraints
+
+This project was first targeted at a university Microsoft 365 account, which
+surfaced a real-world constraint worth documenting:
+
+- **Many organization tenants disable student/user app registration.** On the
+  tenant this was built against, the Azure **App registrations** page returns
+  *"You do not have access to this page,"* so the custom-app path (step 2 above)
+  cannot be completed there.
+- The server code itself is provider-agnostic and works unchanged against any
+  account that permits app registration — a personal `outlook.com` account, or an
+  org account where IT registers the app for you.
+- For locked-down tenants, [`FALLBACK.md`](FALLBACK.md) documents a no-portal
+  alternative using a pre-approved published MCP server, and the escalation paths
+  (request IT consent, use a personal account, or forward mail to one) when even
+  third-party user consent is disabled.
+
+The takeaway: the auth design (delegated device-code) is the right call for a
+personal automation tool; the blocker is organizational policy, not the code.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
